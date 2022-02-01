@@ -238,7 +238,7 @@ def repr_def(obj, show_private=False):
     return "{cls}({attrs!r})".format(
         cls=type(obj).__name__,
         attrs=(vars(obj) if show_private
-               else {k: v for k, v in vars(obj).items() if k.startswith('_')})
+               else {k: v for k, v in vars(obj).items() if not k.startswith('_')})
     )
 
 
