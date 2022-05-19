@@ -29,9 +29,7 @@ def run(dataset: Dataset, config: TaskConfig):
     )
 
     if config.max_runtime_seconds <= 60:  # Modela needs at least 5-10 mins to process/train any dataset
-        config.max_runtime_seconds = 600
-
-    print(dataset.test.X, dataset.test.y.squeeze())
+        config.max_runtime_seconds = 10000
 
     env = os.environ.copy()
     del env['PATH']

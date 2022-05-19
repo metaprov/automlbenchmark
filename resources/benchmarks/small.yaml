@@ -1,29 +1,5 @@
 ---
 
-- name: Australian
-  openml_task_id: 146818
-
-- name: blood-transfusion
-  openml_task_id: 10101
-
-- name: car
-  openml_task_id: 146821
-
-- name: christine
-  openml_task_id: 168908
-
-- name: cnae-9
-  openml_task_id: 9981
-
-- name: credit-g
-  openml_task_id: 31
-
-- name: dilbert
-  openml_task_id: 168909
-
-- name: fabert
-  openml_task_id: 168910
-
 - name: jasmine
   openml_task_id: 168911
 

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 HERE=$(dirname "$0")
-VERSION=${1:-"0.521"}
+VERSION=${1:-"stable"}
 REPO=${2:-"https://github.com/metaprov/modela-python-sdk.git"}
 PKG=${3:-"modela"}
 API_PKG=${4:-"modelaapi"}
-API_VERSION=${4:-"0.4.490"}
+API_VERSION=${4:-"0.4.602"}
 if [[ "$VERSION" == "latest" ]]; then
     VERSION="master"
 fi

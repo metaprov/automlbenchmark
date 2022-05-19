@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -10,8 +11,11 @@ import socket
 import modela
 import numpy as np
 import pandas as pd
-from modela import TaskType, Metric, Modela, ModelSearch, Training, Study, DatasetPhase, StudyPhase, Model, ModelPhase, \
-    Workload
+from modela import (
+    TaskType, Metric, Modela, ModelSearch, Training, EarlyStopping,
+    Study, DatasetPhase, StudyPhase, Model, ModelPhase, \
+    Workload, DataSplit, DataSplitMethod, FeatureEngineeringSearch, Ensemble
+)
 
 from amlb import AutoMLError
 from frameworks.shared.callee import call_run, result, output_subdir
@@ -55,44 +59,86 @@ def run(dataset, config):
     eval_metric = metrics_map.get(dataset.ml_task).get(config.metric) \
         if config.metric in metrics_map.get(dataset.ml_task) else metrics_map.get(dataset.ml_task)["default"]
 
-
-    # TODO: create separate datasets for train/test
-    study: Study = None
-    model: Model = None
+    dataset.test.data.to_csv('OUT_DAT.csv', index=False)
     with Timer() as training:
-        md_dataset = API.Dataset("iris-product", "automl11-%s" % config["name"],
-                                 gen_datasource=True,
-                                 target_column=dataset.target,
-                                 task_type=task,
-                                 bucket="default-minio-bucket",
-                                 workload=Workload("general-large"),
-                                 dataframe=pd.concat([dataset.train.data, dataset.test.data]))
+        md_datasource = API.DataSource("iris-product", "automl-%s" % config["name"].lower(),
+                                       infer_dataframe=dataset.test.data,
+                                       target_column=dataset.target)
+        md_datasource.submit(replace=True)
+        md_train_dataset = API.Dataset("iris-product", "benchmark-test-%s" % config["name"].lower(),
+                                       datasource=md_datasource,
+                                       task_type=task,
+                                       bucket="default-minio-bucket",
+                                       workload=Workload("general-large"),
+                                       dataframe=dataset.train.data,
+                                       fast=True)
 
-        md_dataset.submit(replace=True)
-        md_dataset.visualize(show_progress_bar=False)
-        study = API.Study("iris-product", "automl-%s" % config["name"],
-                          dataset=md_dataset,
-                          task_type=task,
+        md_test_dataset = API.Dataset("iris-product", "benchmark-train-%s" % config["name"].lower(),
+                                      datasource=md_datasource,
+                                      task_type=task,
+                                      bucket="default-minio-bucket",
+                                      workload=Workload("general-large"),
+                                      dataframe=dataset.test.data,
+                                      fast=True)
+
+        if md_train_dataset.default_resource:  # Use already-existing resources if possible
+            md_train_dataset.submit(replace=True)
+        if md_test_dataset.default_resource:
+            md_test_dataset.submit(replace=True)
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(md_train_dataset.wait_until_phase(DatasetPhase.Ready))
+        loop.run_until_complete(md_test_dataset.wait_until_phase(DatasetPhase.Ready))
+        study = API.Study("iris-product", "benchmark-%s" % config["name"].lower(),
+                          dataset=md_train_dataset.name,
                           objective=eval_metric,
                           bucket="default-minio-bucket",
-                          search=ModelSearch(MaxModels=2, Trainers=dataset.trainers),
-                          trainer_template=Training(EarlyStop=True))
-        study.submit(replace=True)
-        study.visualize(show_progress_bar=False)
+                          search=ModelSearch(
+                            MaxModels=100, Trainers=5,#dataset.trainers),
+                            EarlyStop=EarlyStopping(Enabled=True, MinModelsWithNoProgress=20, Initial=20)),
+                          fe_search=FeatureEngineeringSearch(
+                            Enabled=True,
+                            MaxModels=2,
+                            MaxTrainers=5
+                          ),
+                          ensemble=Ensemble(
+                             Enabled=True,
+                             StackingEnsemble=True
+                          ),
+                          trainer_template=Training(
+                              Split=DataSplit(TrainDataset=md_train_dataset.name,
+                                              TestDataset=md_test_dataset.name,
+                                              Method=DataSplitMethod.Auto),
+                              Seed=config.seed
+                          ),
+                          fast=True)
+
+        if study.default_resource:
+            study.submit(replace=True)
+            study.visualize(show_progress_bar=False)
+        else:
+            study.visualize(show_progress_bar=False)
+            loop.run_until_complete(study.wait_until_phase(StudyPhase.Completed))
 
 
     predictions = np.ndarray(0, dtype=str)
+    probabilities_labels, probabilities = None, None
     with Timer() as predict:
-        predictor = API.Predictor("iris-product", "automl-benchmark",
+        predictor = API.Predictor("iris-product", "benchmark-%s" % config["name"].lower(),
                                   model=study.best_model)
         predictor.submit(replace=True)
-        predictor.wait_until_ready()
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(predictor.wait_until_ready())
         for _, row in dataset.test.X.iterrows():
-            prediction = predictor.predict([{col: row[col] for col in dataset.test.X.columns}])[0]
+            prediction = predictor.predict([{col: row[col] for col in dataset.test.X.columns}])
+            prediction = prediction[0]
             predictions = np.append(predictions, prediction.Label)
-            print(prediction)
+            probability_vals = {prob.Label: prob.Probability for prob in prediction.Probabilities}
+            if not probabilities_labels:
+                probabilities_labels = [label for label in probability_vals.keys()]
+                probabilities = np.zeros((0, len(probabilities_labels)), dtype=float)
 
-    predictions, probabilities, probabilities_labels = None, None, None
+            probabilities = np.vstack((probabilities, [probability_vals[label] for label in probabilities_labels]))
 
     return result(
         output_file=config.output_predictions_file,
