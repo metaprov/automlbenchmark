@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -14,7 +15,7 @@ import pandas as pd
 from modela import (
     TaskType, Metric, Modela, ModelSearch, Training, EarlyStopping,
     Study, DatasetPhase, StudyPhase, Model, ModelPhase, \
-    Workload, DataSplit, DataSplitMethod, FeatureEngineeringSearch, Ensemble
+    Workload, DataSplit, DataSplitMethod, FeatureEngineeringSearch, Ensemble, Predictor, ClassicEstimator
 )
 
 from amlb import AutoMLError
@@ -28,7 +29,7 @@ def run(dataset, config):
     log.info(f"\n**** Modela SDK [v{modela.__version__}] ****\n")
     API: Modela = None
     try:
-        API = Modela(port_forward=True, username="admin", password="admin")
+        API = Modela(port_forward=True, username="admin", password="admin", tenant="modela")
     except Exception as ex:
         log.error("Unable to connect to API gateway: %s", ex)
 
@@ -56,28 +57,46 @@ def run(dataset, config):
         )
     )
 
+    estimator_map = dict(
+        binary=ClassicEstimator.XGBClassifier,
+        multiclass=ClassicEstimator.XGBClassifier,
+        regression=ClassicEstimator.XGBRegressor
+    )
+
     eval_metric = metrics_map.get(dataset.ml_task).get(config.metric) \
         if config.metric in metrics_map.get(dataset.ml_task) else metrics_map.get(dataset.ml_task)["default"]
 
-    dataset.test.data.to_csv('OUT_DAT.csv', index=False)
+    config["name"] = config["name"].replace("_", "-", -1)
+    predictor = API.Predictor("iris-product", "benchmark-%s" % config["name"].lower())
+    if not predictor.default_resource:
+        predictions, probabilities, probabilities_labels = make_prediction(dataset, predictor, config.type != "classification")
+        return result(
+            output_file=config.output_predictions_file,
+            predictions=predictions,
+            truth=dataset.test.y.squeeze(),
+            probabilities=probabilities,
+            probabilities_labels=probabilities_labels,
+        )
+
+    dataset.train.data.to_csv('OUT_DAT.csv', index=False)
     with Timer() as training:
         md_datasource = API.DataSource("iris-product", "automl-%s" % config["name"].lower(),
                                        infer_dataframe=dataset.test.data,
                                        target_column=dataset.target)
         md_datasource.submit(replace=True)
-        md_train_dataset = API.Dataset("iris-product", "benchmark-test-%s" % config["name"].lower(),
+        md_train_dataset = API.Dataset("iris-product", "benchmark-train-%s" % config["name"].lower(),
                                        datasource=md_datasource,
                                        task_type=task,
                                        bucket="default-minio-bucket",
-                                       workload=Workload("general-large"),
+                                       workload=Workload("memory-xlarge"),
                                        dataframe=dataset.train.data,
                                        fast=True)
 
-        md_test_dataset = API.Dataset("iris-product", "benchmark-train-%s" % config["name"].lower(),
+        md_test_dataset = API.Dataset("iris-product", "benchmark-test-%s" % config["name"].lower(),
                                       datasource=md_datasource,
                                       task_type=task,
                                       bucket="default-minio-bucket",
-                                      workload=Workload("general-large"),
+                                      workload=Workload("memory-xlarge"),
                                       dataframe=dataset.test.data,
                                       fast=True)
 
@@ -94,21 +113,26 @@ def run(dataset, config):
                           objective=eval_metric,
                           bucket="default-minio-bucket",
                           search=ModelSearch(
-                            MaxModels=100, Trainers=5,#dataset.trainers),
-                            EarlyStop=EarlyStopping(Enabled=True, MinModelsWithNoProgress=20, Initial=20)),
+                            MaxModels=100, Trainers=4,#dataset.trainers),
+                            EarlyStop=EarlyStopping(Enabled=True, MinModelsWithNoProgress=20, Initial=50),
+                            MinBestScore=10000
+                          ),
                           fe_search=FeatureEngineeringSearch(
                             Enabled=True,
-                            MaxModels=2,
-                            MaxTrainers=5
+                            MaxModels=10,
+                            MaxTrainers=5,
+                            Estimator=estimator_map.get(dataset.ml_task)
                           ),
                           ensemble=Ensemble(
                              Enabled=True,
-                             StackingEnsemble=True
+                             StackingEnsemble=True,
+                             VotingEnsemble=True
                           ),
                           trainer_template=Training(
                               Split=DataSplit(TrainDataset=md_train_dataset.name,
                                               TestDataset=md_test_dataset.name,
                                               Method=DataSplitMethod.Auto),
+                              Resources=Workload("compute-2xlarge"),
                               Seed=config.seed
                           ),
                           fast=True)
@@ -121,24 +145,12 @@ def run(dataset, config):
             loop.run_until_complete(study.wait_until_phase(StudyPhase.Completed))
 
 
-    predictions = np.ndarray(0, dtype=str)
-    probabilities_labels, probabilities = None, None
     with Timer() as predict:
         predictor = API.Predictor("iris-product", "benchmark-%s" % config["name"].lower(),
-                                  model=study.best_model)
+                                  model=study.best_model.name)
         predictor.submit(replace=True)
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(predictor.wait_until_ready())
-        for _, row in dataset.test.X.iterrows():
-            prediction = predictor.predict([{col: row[col] for col in dataset.test.X.columns}])
-            prediction = prediction[0]
-            predictions = np.append(predictions, prediction.Label)
-            probability_vals = {prob.Label: prob.Probability for prob in prediction.Probabilities}
-            if not probabilities_labels:
-                probabilities_labels = [label for label in probability_vals.keys()]
-                probabilities = np.zeros((0, len(probabilities_labels)), dtype=float)
+        predictions, probabilities, probabilities_labels = make_prediction(dataset, predictor, config.type != "classification")
 
-            probabilities = np.vstack((probabilities, [probability_vals[label] for label in probabilities_labels]))
 
     return result(
         output_file=config.output_predictions_file,
@@ -150,6 +162,31 @@ def run(dataset, config):
         training_duration=training.duration,
         predict_duration=predict.duration
     )
+
+def convert(o):
+    if isinstance(o, np.generic): return o.item()
+    raise TypeError
+
+def make_prediction(dataset, predictor: Predictor, regression=False):
+    predictions = np.ndarray(0, dtype=str)
+    probabilities_labels, probabilities = None, None
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(predictor.wait_until_ready())
+    for _, row in dataset.test.X.iterrows():
+        prediction = predictor.predict(json.dumps([{col: row[col] for col in dataset.test.X.columns}], default=convert))
+        prediction = prediction[0]
+        predictions = np.append(predictions, prediction.Label)
+        if regression:
+            continue
+
+        probability_vals = {prob.Label: prob.Probability for prob in prediction.Probabilities}
+        if not probabilities_labels:
+            probabilities_labels = [label for label in probability_vals.keys()]
+            probabilities = np.zeros((0, len(probabilities_labels)), dtype=float)
+
+        probabilities = np.vstack((probabilities, [probability_vals[label] for label in probabilities_labels]))
+
+    return predictions, probabilities, probabilities_labels
 
 
 if __name__ == "__main__":

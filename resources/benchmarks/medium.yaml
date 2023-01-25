@@ -1,9 +1,11 @@
 ---
 
-- name: adult
-  openml_task_id: 7592
 
-- name: Amazon_employee_access
+- name: KDDCup09-appetency
+  openml_task_id: 3945
+
+
+- name: Amazon-employee-access
   openml_task_id: 34539
 
 - name: APSFailure
@@ -32,9 +34,6 @@
 
 - name: jungle_chess_2pcs_raw_endgame_complete
   openml_task_id: 167119
-
-- name: KDDCup09_appetency
-  openml_task_id: 3945
 
 - name: MiniBooNE
   openml_task_id: 168335

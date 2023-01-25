@@ -1,7 +1,10 @@
 ---
 
-- name: jasmine
-  openml_task_id: 168911
+- name: blood-transfusion
+  openml_task_id: 10101
+
+- name: car
+  openml_task_id: 146821
 
 - name: kc1
   openml_task_id: 3917
